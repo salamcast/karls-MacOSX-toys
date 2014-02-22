@@ -1,0 +1,166 @@
+#!/bin/sh
+# Copyright 1997-2004 Apple Computer, Inc.
+
+. /etc/rc.common
+
+export -n SafeBoot
+export -n VerboseFlag
+export -n FsckSlash
+export -n NetBoot
+
+ramd()
+{
+ ####### make the ram disk
+ if [ $3 = 'm' ] ; then
+  R=$(expr 2 \* $(expr 1024 \* $2))
+ else
+  R=$(expr 2 \* $2)
+ fi
+
+ RAM=$(hdik -drivekey system-image=yes -nomount ram://$R || exit 1)
+ if [ $? -eq 0 ] ; then
+  newfs $RAM
+  mount -o union -o nobrowse $RAM $1 || exit 1
+ fi
+}
+
+
+echo "Mounting local filesystems"
+mount -uw /
+[ -f /etc/fstab ] && mount -vat nonfs
+
+ramd '/Volumes/' 128 'k'
+
+BootCacheControl=/System/Library/Extensions/BootCache.kext/Contents/Resources/BootCacheControl
+if [ ! -f $BootCacheControl ]; then
+	BootCacheControl=/usr/sbin/BootCacheControl
+fi
+if [ "${SafeBoot}" != "-x" -a -x "${BootCacheControl}" ]; then
+	${BootCacheControl} start
+fi
+
+
+sysctl -w kern.sysv.shmmax=4194304 kern.sysv.shmmin=1 kern.sysv.shmmni=32 kern.sysv.shmseg=8 kern.sysv.shmall=1024
+
+if [ -f /var/account/acct ]; then
+	accton /var/account/acct
+fi
+
+echo "Resetting files and devices"
+
+RMRF_ITEMS="/mach.sym /var/tmp/folders.*"
+
+##
+# If the shutdown command was used to shut the system down, the file
+# /etc/nologin may have been created to prevent users from logging in.  
+# Remove it so that logins are enabled when the system comes up.
+##
+RMRF_ITEMS="$RMRF_ITEMS /etc/nologin"
+
+# Clean out /private/tmp.
+if [ -d /private/tmp ]; then
+ # blow away any _tmp_ in case it exists as well
+ ramd '/private/tmp' 64 'm'
+ ramd '/var/tmp' 24 'm'
+ mkdir -m 1777 /var/tmp/mds
+fi
+
+# Move /var/run out of the way
+if [ -d /var/run ]; then
+ ramd '/var/run' 256 'k'
+
+ mkdir -m 775 /var/run/StartupItems /var/run/davlocks
+ mkdir -m 755 /var/run/proxy
+ chown root:daemon /var/run /var/run/StartupItems
+ chown www:www /var/run/proxy /var/run/davlocks
+ touch -t 198501010000 /var/run/sudo/*
+
+ # Clear utmp (who is logged on).
+ touch /var/run/utmp /var/run/utmpx
+
+fi
+
+ramd '/var/spool/lock' 128 'k'
+# Clear /var/spool/lock
+if [ -d /var/spool/lock ]; then
+	find /var/spool/lock -not -type d -print0 | xargs -0 rm -f
+fi
+
+echo "Starting virtual memory"
+
+swapdir=/private/var/vm
+ramd ${swapdir} 256 'm'
+
+if [ ${ENCRYPTSWAP:=-NO-} = "-YES-" ]; then
+    encryptswap="-E"
+else
+    encryptswap=""
+fi
+/sbin/dynamic_pager ${encryptswap} -F ${swapdir}/swapfile
+
+appprofiledir=/private/var/vm/app_profile
+
+if [ ! -d ${appprofiledir} ]; then
+	if [ -f  ${appprofiledir} ]; then
+		mv -f ${appprofiledir} "${appprofiledir}_" 
+	fi
+	mkdir -p -m 711 ${appprofiledir}
+	chown root:wheel ${appprofiledir}
+fi
+
+# Create mach symbol file
+sysctl -n kern.symfile
+if [ -f /mach.sym ]; then
+	ln -sf /mach.sym /mach
+else
+	ln -sf /mach_kernel /mach
+fi
+
+ # Move /private/var/db/netinfo to /tmp so it can be relocated
+ # read-write to the /private/var/db/netinfo ramdisk 
+ cp -r /var/db/netinfo /private/tmp/netinfo.$$
+
+ # allow netinfo to run in standard location; ramdisk in /var/db/netinfo for it
+ ramd '/private/var/db/netinfo' 10 'm'
+
+ # move /var/db/netinfo to ramdisk and clean up
+ cp -r /private/tmp/netinfo.$$/* /var/db/netinfo
+ rm -rf /private/tmp/netinfo.$$
+
+
+if [ -f /etc/security/rc.audit ]; then
+	. /etc/security/rc.audit
+fi
+
+if [ -f /Library/Preferences/com.apple.sharing.firewall.plist ]; then
+	/usr/libexec/FirewallTool
+fi
+
+# Load [ideally on demand] daemons
+if [ "${SafeBoot}" = "-x" ]; then
+	launchctl load /System/Library/LaunchDaemons /etc/mach_init.d
+else
+	launchctl load /Library/LaunchDaemons /System/Library/LaunchDaemons /etc/mach_init.d
+	SystemStarter ${VerboseFlag}
+fi
+
+ramd '/var/log/' 3 'm'
+
+# Set language from CDIS.custom - assumes this is parse-able by sh
+echo "LANGUAGE=English" > "/var/log/CDIS.custom"
+
+if [ -f /var/log/CDIS.custom ]; then
+	. /var/log/CDIS.custom 
+fi
+
+export LANGUAGE
+
+
+
+touch /var/run/.systemStarterRunning
+
+if [ "${VerboseFlag}" != "-v" ] ; then
+	/usr/libexec/WaitingForLoginWindow
+fi
+
+exit 0
